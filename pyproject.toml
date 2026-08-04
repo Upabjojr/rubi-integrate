@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rubi-integrate"
+version = "0.0.3"
+description = "Rule-based symbolic integration: the Rubi rule set on SymPy/OmniMatch"
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "sympy-wolfram>=0.0.3",
+    "sympy-matching>=0.0.3",
+    "omnimatch",
+    "sympy",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+tests = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["rubi_integrate*"]

@@ -1,0 +1,1148 @@
+# -*- coding: utf-8 -*-
+"""Rubi utility expression wrappers — the DEFERRED half of the utility layer.
+
+Rubi's rules are RuleDelayed (``:>``): a utility call on the right-hand side,
+e.g. ``ExpandToSum[v, x]``, must evaluate only WHEN THE RULE FIRES, with the
+matched value of ``v`` — never at rule-definition/import time while ``v`` is
+still a symbolic wildcard.
+
+To model that, every RUBI utility exists in two forms:
+
+* ``utility_functions.eager_<Name>`` — an EAGER plain Python function that
+  computes immediately. This is the real implementation.
+* ``rubi_utils.<Name>`` — a DEFERRED ``MathematicaExpr`` subclass keeping the
+  bare Mathematica name. Constructing it (``ExpandToSum(v_, x)``) just builds an
+  unevaluated node; its ``_evaluate`` (invoked by ``.doit()``) delegates to the
+  eager ``utility_functions.eager_<Name>``.
+
+Generated rule modules import the DEFERRED classes (via ``from rubi_utils import *``)
+so replacement expressions hold unevaluated nodes. ``_make_replacement_fn``
+(sympy_matching/matching_rule.py) substitutes the matched wildcard values first and
+only then calls ``.doit()`` — so the eager function runs at fire time on concrete
+arguments, exactly like Mathematica's ``:>``.
+
+Rule of thumb: a deferred ``_evaluate`` should call its eager counterpart rather
+than re-implement the logic (e.g. ``ExpandToSum._evaluate`` must delegate — plain
+``sympy.expand`` does NOT collect ``x - I*x`` into ``(1-I)*x``, so it would not
+produce the canonical ``a+b*x+c*x**2`` the rule patterns match).
+
+Common Wolfram Mathematica expression classes shared with other packages are
+re-exported from ``sympy_wolfram.objects``. Only RUBI-specific
+expressions and wrappers around RUBI utility functions are defined locally.
+
+Mathematica originals are documented in:
+    Rubi/Rubi/IntegrationUtilityFunctions.m
+"""
+import sympy
+from sympy import (Symbol, Integer, Rational, Add, Mul, Pow, S,
+                   expand, simplify, together, gcd, numer, sign,
+                   Poly, frac, floor, Expr)
+
+from sympy_wolfram.objects import (
+    Block,
+    CompoundExpression,
+    Null,
+    Condition,   # standard Wolfram node; defined in sympy_wolfram, re-exported here
+    Head,
+    If,
+    List,
+    MathematicaExpr,
+    Module,
+    Set,
+    With,
+    D,
+    _condition_holds,
+)
+from sympy_wolfram.objects import (
+    Gamma,
+)
+# EAGER helpers that generated rules call by name. They must evaluate AT
+# CONSTRUCTION -- these heads occur in rule PATTERNS, where a deferred node
+# would only match another deferred node instead of a caller's LambertW / I*a.
+from sympy_wolfram.functions_eager import (
+    eager_Complex,
+    eager_Identity,
+    eager_ProductLog,
+)
+# Standard Wolfram-language function nodes — moved to sympy_wolfram (not
+# Rubi-specific). Re-exported here so generated rules (which do
+# `from ...rubi_utils import *`) keep resolving them unchanged.
+from sympy_wolfram.mathematica_functions import (
+    Apart,
+    Apply,
+    Binomial,
+    Coefficient,
+    Complex,
+    Denominator,
+    Discriminant,
+    BesselJ,
+    ExpIntegralEi,
+    Identity,
+    LogIntegral,
+    ExpIntegralE,
+    Factorial,
+    PolyGamma,
+    Root,
+    Zeta,
+    EllipticPi,
+    Exponent,
+    First,
+    Floor,
+    FullSimplify,
+    FunctionExpand,
+    GCD,
+    Hypergeometric2F1,
+    LeafCount,
+    Length,
+    Not,
+    Numerator,
+    Part,
+    PolynomialQuotient,
+    PolynomialRemainder,
+    ProductLog,
+    Quotient,
+    ReplaceAll,
+    Rest,
+    Rule,
+    Sign,
+    Simplify,
+    Sum,
+    SumWolfram,
+    Together,
+)
+
+# =============================================================================
+# Subst[expr, x, v] — substitute x=v in expr
+# =============================================================================
+
+class Subst(MathematicaExpr):
+    """Rubi Subst[expr, x, v] -> substitute x=v in expr.
+
+    In Rubi, Subst also simplifies constant terms to 0 in antiderivatives,
+    but for rule generation we use plain substitution.
+
+    Special case ``Subst[Int[g, x], x, v]``: Rubi integrates the inner ``Int``
+    first (``G = ∫g dx``) and only then substitutes ``x -> v`` (giving ``G(v)``).
+    Substituting *before* the integral is resolved would capture the ``Int``'s
+    bound variable — and ``v`` often reintroduces ``x`` (e.g. ``v = log(x)``),
+    which silently produces a wrong answer. So while ``expr`` still holds an
+    unevaluated ``Int`` we stay deferred; the DFS integrator reduces that ``Int``
+    to an antiderivative and then performs the substitution itself (see
+    ``_dfs_reduce_result`` in ``base_objects``).
+    """
+
+    def __new__(cls, expr, x, v):
+        return Expr.__new__(cls, expr, x, v)
+
+    def _evaluate(self, **kwargs):
+        expr, x, v = self.args
+        if any(type(a).__name__ == 'Int' for a in expr.atoms(sympy.Function)):
+            return self
+        return expr.subs(x, v)
+
+
+# =============================================================================
+# Simp[expr] or Simp[expr, x] — simplify expression
+# =============================================================================
+
+class Simp(MathematicaExpr):
+    """Rubi Simp[expr] or Simp[expr, x] -> simplify expression."""
+
+    def __new__(cls, expr, x=None):
+        if x is None:
+            return Expr.__new__(cls, expr)
+        return Expr.__new__(cls, expr, x)
+
+    def _evaluate(self, **kwargs):
+        expr = self.args[0]
+        return simplify(expr)
+
+
+# =============================================================================
+# FracPart[u] — sum of non-integer terms
+# =============================================================================
+
+class FracPart(MathematicaExpr):
+    """Rubi FracPart[u] -> sum of non-integer terms of u.
+
+    For a rational number: returns the fractional part.
+    For a sum: returns the sum of non-integer terms.
+    """
+
+    def __new__(cls, u, n=S.One):
+        n = sympy.sympify(n)
+        return Expr.__new__(cls, u, n)
+
+    def _evaluate(self, **kwargs):
+        # Rubi: FracPart[u,n] = FractionalPart[n*u] for rationals -- TRUNCATION toward
+        # zero (FracPart[-3/2] = -1/2), NOT sympy's frac (periodic; frac(-3/2) = 1/2).
+        # The sign of the surviving fractional exponent matters for branch-cut-sensitive
+        # forms like (a+b x)^FracPart[p]. Delegates to the eager implementation.
+        u, n = self.args
+        if n == S.One:
+            from .utility_functions import eager_FracPart
+            return eager_FracPart(u)
+        if u.is_Rational:
+            from .utility_functions import FractionalPart
+            return FractionalPart(n * u)
+        if u.is_Add:
+            result = S.Zero
+            for term in u.args:
+                result += FracPart(term, n).doit()
+            return result
+        return n * u
+
+
+# =============================================================================
+# IntPart[u] — sum of integer terms
+# =============================================================================
+
+class IntPart(MathematicaExpr):
+    """Rubi IntPart[u] -> sum of integer terms of u.
+
+    For a rational number: returns the integer part (floor).
+    For a sum: returns the sum of integer parts.
+    """
+
+    def __new__(cls, u, n=S.One):
+        n = sympy.sympify(n)
+        return Expr.__new__(cls, u, n)
+
+    def _evaluate(self, **kwargs):
+        # Rubi: IntPart[u,n] = IntegerPart[n*u] for rationals -- truncation toward zero
+        # (IntPart[-3/2] = -1), NOT floor (-2). Delegates to the eager implementation.
+        u, n = self.args
+        if n == S.One:
+            from .utility_functions import eager_IntPart
+            return eager_IntPart(u)
+        if u.is_Rational:
+            from .utility_functions import IntegerPart
+            return IntegerPart(n * u)
+        if u.is_Add:
+            result = S.Zero
+            for term in u.args:
+                result += IntPart(term, n).doit()
+            return result
+        return S.Zero
+
+
+# =============================================================================
+# ExpandToSum[u, x] — expand into sum of monomials
+# =============================================================================
+
+class ExpandToSum(MathematicaExpr):
+    """Rubi ExpandToSum[u, x] or ExpandToSum[u, v, x].
+
+    2-arg: expand u into sum of monomials in x.
+    3-arg: ExpandToSum[u, v, x] -> distributes u over expand(v).
+    """
+
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+
+    def _evaluate(self, **kwargs):
+        # Delegate to the eager implementation, which collects into canonical
+        # a + b*x + c*x**2 form (plain sympy.expand does NOT combine terms like
+        # x - I*x, so the result would not match the a+b*x+c*x**2 rule patterns).
+        from .utility_functions import eager_ExpandToSum
+        return eager_ExpandToSum(*self.args)
+
+
+# =============================================================================
+# ExpandIntegrand[u, x] or ExpandIntegrand[u, v, x]
+# =============================================================================
+
+class ExpandIntegrand(MathematicaExpr):
+    """Rubi ExpandIntegrand[u, x] or ExpandIntegrand[u, v, x].
+
+    2-arg: expand u as integrand w.r.t. x.
+    3-arg: expand u*v as integrand w.r.t. x.
+    """
+
+    def __new__(cls, *args):
+        args = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *args)
+
+    def _evaluate(self, **kwargs):
+        # Delegate to the EAGER ExpandIntegrand, never re-implement it. A plain
+        # sympy.expand here is wrong: for x/(a+b*x)^2 it multiplies the denominator
+        # out to x/(a^2+2*a*b*x+b^2*x^2) instead of the partial-fraction expansion
+        # 1/(b*(a+b*x)) - a/(b*(a+b*x)^2). The mis-expansion made rule 1.1.1.2#12
+        # feed a re-expandable form back into itself (via 9.1#47), an infinite
+        # descent with geometrically growing coefficients that the exact-match cycle
+        # detector cannot see -- so x/(a+b*x)^2 timed out and x^2/(a+b*x)^2 "solved"
+        # to a junk form carrying 1073741824*b**30.
+        from .utility_functions import eager_ExpandIntegrand
+        return eager_ExpandIntegrand(*self.args)
+
+
+# =============================================================================
+# Coeff[u, x, n] — coefficient (Rubi internal variant)
+# =============================================================================
+
+class Coeff(MathematicaExpr):
+    """Rubi Coeff[u, x, n] -> coefficient of x^n in u."""
+
+    def __new__(cls, u, x, n):
+        n = sympy.sympify(n)
+        return Expr.__new__(cls, u, x, n)
+
+    def _evaluate(self, **kwargs):
+        # Delegate to the eager utility, which handles a symbolic n (via
+        # Util_Coefficient) -- `u.coeff(x, int(n))` crashed on symbolic n
+        # ('Cannot convert symbols to int').
+        from .utility_functions import eager_Coeff
+        u, x, n = self.args
+        return eager_Coeff(u, x, n)
+
+
+# =============================================================================
+# Expon[u, x] — degree of polynomial
+# =============================================================================
+
+class Expon(MathematicaExpr):
+    """Rubi Expon[u, x] or Expon[u, x, Min/Max] -> degree of u in x.
+
+    2-arg: maximum (leading) degree.
+    3-arg with Symbol('Min'): minimum non-zero degree.
+    3-arg with Symbol('Max'): maximum degree (same as 2-arg).
+    """
+
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+
+    def _evaluate(self, **kwargs):
+        # Rubi: Expon[u, x] := Exponent[Together[u], x] (and the 3-arg Min/Max form).
+        # Delegate to the Mathematica-faithful Exponent (Together already folded in),
+        # which -- unlike the old Poly-based code that returned 0 on any non-polynomial
+        # (Sqrt[x]+x, 1/x+x, Sin[x] x^2, ...) -- gives the true max/min power of x.
+        from sympy_wolfram.functions_eager import eager_Exponent
+        args = self.args
+        u, x = args[0], args[1]
+        order_func = args[2] if len(args) >= 3 else None
+        return eager_Exponent(u, x, order_func)
+
+
+# =============================================================================
+# Simplify — wraps sympy.simplify
+# =============================================================================
+
+class RubiSimplify(MathematicaExpr):
+    """Rubi Simplify[expr] -> simplify expression."""
+
+    def __new__(cls, expr):
+        return Expr.__new__(cls, expr)
+
+    def _evaluate(self, **kwargs):
+        expr, = self.args
+        return simplify(expr)
+
+
+# =============================================================================
+# CannotIntegrate[expr, x] — integration failure sentinel
+# =============================================================================
+
+class CannotIntegrate(MathematicaExpr):
+    """Mathematica CannotIntegrate[expr, x] — integration failure sentinel.
+
+    Returned unevaluated when no Rubi rule applies to the integrand.
+    _evaluate returns self so the sentinel propagates unchanged through
+    any further .doit() calls.
+    """
+
+    def __new__(cls, expr, x):
+        return Expr.__new__(cls, expr, x)
+
+    def _evaluate(self, **kwargs):
+        # Terminal sentinel: stays unevaluated.
+        return self
+
+
+# =============================================================================
+# Condition[expr, test] — conditional expression
+# =============================================================================
+
+# =============================================================================
+# Unintegrable[expr, x] — integration failure sentinel
+# =============================================================================
+
+class Unintegrable(MathematicaExpr):
+    """Rubi Unintegrable[expr, x] — marks that no rule could integrate expr.
+
+    Different from CannotIntegrate; used for trig/special-function integrands
+    that Rubi declines to reduce. Stays unevaluated.
+    """
+
+    def __new__(cls, expr, x):
+        return Expr.__new__(cls, expr, x)
+
+    def _evaluate(self, **kwargs):
+        return self
+
+
+# =============================================================================
+# IntHide[u, x] — integrate with step display suppressed
+# =============================================================================
+
+class IntHide(MathematicaExpr):
+    """Rubi ``IntHide[u, x] := Block[{$ShowSteps=False}, Int[u, x]]``.
+
+    IntHide actually integrates ``u`` (only the step display is suppressed). Many
+    rules bind a local to ``IntHide[...]`` and then use its antiderivative (3.1.4,
+    the inverse-hyperbolic families, …); leaving it unevaluated breaks all of them.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+
+    def _evaluate(self, **kwargs):
+        u, x = self.args
+        from rubi_integrate.base_objects import rubi_integrate, Int
+        result = rubi_integrate(u, x)
+        # If integration didn't finish, fall back to the passive Int so the caller
+        # can proceed (and never leave an unevaluated IntHide behind).
+        if result.has(Int) or 'CannotIntegrate' in str(result) or 'Unintegrable' in str(result):
+            return Int(u, x)
+        return result
+
+
+class FunctionOfExponential(MathematicaExpr):
+    """Deferred FunctionOfExponential[u, x] -- delegates to the eager utility.
+
+    Returns the base exponential ``E^(a+b x)`` that ``u`` is a function of.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfExponential
+        return eager_FunctionOfExponential(*self.args)
+
+
+class FunctionOfExponentialFunction(MathematicaExpr):
+    """Deferred FunctionOfExponentialFunction[u, x] -- delegates to the eager utility.
+
+    Rewrites ``u`` as a function of a new variable standing in for the exponential.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfExponentialFunction
+        return eager_FunctionOfExponentialFunction(*self.args)
+
+
+class SubstPower(MathematicaExpr):
+    """Deferred SubstPower[Fx, x, n] -- replace every ``x`` in ``Fx`` by ``x**n``."""
+
+    def __new__(cls, Fx, x, n):
+        return Expr.__new__(cls, sympy.sympify(Fx), sympy.sympify(x), sympy.sympify(n))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SubstPower
+        return eager_SubstPower(*self.args)
+
+
+class SubstForInverseFunction(MathematicaExpr):
+    """Deferred SubstForInverseFunction[u, v, x] / [u, v, w, x].
+
+    Three-arg form: ``v`` is ``g[a+b*x]``; substitutes ``x -> (g^-1[x] - a)/b`` and
+    replaces occurrences of ``v`` by ``x``.
+    """
+
+    def __new__(cls, *args):
+        return Expr.__new__(cls, *[sympy.sympify(a) for a in args])
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SubstForInverseFunction
+        result = eager_SubstForInverseFunction(*self.args)
+        return sympy.S.false if result is False else result
+
+
+class ExpandTrigExpand(MathematicaExpr):
+    """Deferred ExpandTrigExpand[u, F, v, m, n, x] -- expand ``TrigExpand[F[n x]]^m``,
+    substitute ``x -> v`` and distribute ``u`` over the resulting sum."""
+
+    def __new__(cls, u, F, v, m, n, x):
+        return Expr.__new__(cls, *[sympy.sympify(a) for a in (u, F, v, m, n, x)])
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandTrigExpand
+        return eager_ExpandTrigExpand(*self.args)
+
+
+class FunctionOfSquareRootOfQuadratic(MathematicaExpr):
+    """Deferred FunctionOfSquareRootOfQuadratic[u, x] -- the Euler substitution.
+
+    Returns ``{v, subst, n}`` (read by the rules with ``Part``) or False.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfSquareRootOfQuadratic
+        result = eager_FunctionOfSquareRootOfQuadratic(*self.args)
+        if result is False or result is None:
+            return sympy.S.false
+        if isinstance(result, (list, tuple)):
+            return List(*result)
+        return result
+
+
+class InverseFunctionOfLinear(MathematicaExpr):
+    """Deferred InverseFunctionOfLinear[u, x] -- delegates to the eager utility.
+
+    If ``u`` contains a subexpression ``g[a+b*x]`` with ``g`` an inverse function,
+    returns that subexpression; else False. Rubi-specific
+    (``IntegrationUtilityFunctions.m:6084``), so it lives here rather than in
+    sympy_wolfram.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_InverseFunctionOfLinear
+        result = eager_InverseFunctionOfLinear(*self.args)
+        return sympy.S.false if result is False else result
+
+
+class SubstForFractionalPowerOfQuotientOfLinears(MathematicaExpr):
+    """Deferred SubstForFractionalPowerOfQuotientOfLinears[u, x] -- eager delegate.
+
+    For ``u`` containing ``((a+b*x)/(c+d*x))^(m/n)``, returns the 4-element list
+    ``{v, n, (a+b*x)/(c+d*x), b*c-a*d}``; else False. Rubi-specific
+    (``IntegrationUtilityFunctions.m:1801``).
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SubstForFractionalPowerOfQuotientOfLinears
+        result = eager_SubstForFractionalPowerOfQuotientOfLinears(*self.args)
+        if result is False or result is None:
+            return sympy.S.false
+        if isinstance(result, (list, tuple)):
+            return List(*result)
+        return result
+
+
+class IntSum(MathematicaExpr):
+    """Deferred IntSum[u, x] -- distribute Int over the terms of the sum ``u``.
+
+    Used by Rubi's general sum-splitting rules (9.1 / 1.4.1). Our DFS already splits a
+    top-level Add itself, but those rules can still be reached through the whole-sum
+    match, so the node has to reduce to real ``Int`` terms rather than sit inert.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_IntSum
+        return eager_IntSum(*self.args)
+
+
+class FunctionOfLog(MathematicaExpr):
+    """Deferred FunctionOfLog[u, x] -- delegates to the eager utility.
+
+    If ``u`` is a function of ``Log[a*x^n]``, returns the list ``{f(x), a*x^n, n}``;
+    otherwise False. Drives Rubi's general log-substitution rule (3.5 Miscellaneous
+    logarithms), which rewrites ``Int[f(Log[a x^n])/x, x]`` as
+    ``Subst[Int[f(x), x], x, Log[a x^n]]/n``.
+
+    The eager helper returns a PYTHON list (or the bool False), neither of which is a
+    SymPy object, so ``_evaluate`` hands back a ``List`` / ``S.false`` -- the rule then
+    reads it with ``Part`` and tests it with ``FalseQ``, exactly as Rubi does.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(x))
+
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfLog
+        result = eager_FunctionOfLog(*self.args)
+        if result is False or result is None:
+            return sympy.S.false
+        if isinstance(result, (list, tuple)):
+            return List(*result)
+        return result
+
+
+# =============================================================================
+# PolynomialDivide[u, v, x] — quotient + remainder/v as one expression
+# =============================================================================
+
+class PolynomialDivide(MathematicaExpr):
+    """Rubi PolynomialDivide[u, v, x] = quo(u,v,x) + rem(u,v,x)/v."""
+
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+
+    def _evaluate(self, **kwargs):
+        args = self.args
+        if len(args) == 3:
+            u, v, x = args
+        elif len(args) == 4:
+            u, v, w, x = args
+            u = u.subs(w, x)
+            v = v.subs(w, x)
+        else:
+            return self
+        try:
+            # Delegate to the eager implementation and KEEP THE SUM SPLIT. This used to
+            # wrap the result in ``together(q + r/v)`` -- which recombines quotient and
+            # remainder over the common denominator, exactly UNDOING the division the
+            # rule fired to obtain. `1.1.2.3#21` then handed the DFS the same rational
+            # function it started from (numerator merely expanded), the search wandered
+            # into a trinomial give-up, and `Int[(a+b tan(c+d x)^2)^2]` -- which Rubi
+            # solves in 0.2 s -- came back Unintegrable. Same recombination anti-pattern
+            # as the termwise-apart fix (defects §34/§35).
+            from rubi_integrate.utils.utility_functions import eager_PolynomialDivide
+            return eager_PolynomialDivide(u, v, x)
+        except Exception:
+            return self
+
+
+# =============================================================================
+# NormalizePseudoBinomial[u, x] — rewrite pseudo-binomial as a+b*(c+d*x)^n
+# =============================================================================
+
+class NormalizePseudoBinomial(MathematicaExpr):
+    """Rubi NormalizePseudoBinomial[u, x] — rewrite as a + b*(c+d*x)^n.
+
+    Falls back to u unchanged if the form cannot be detected.
+    """
+
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+
+    def _evaluate(self, **kwargs):
+        u, x = self.args
+        try:
+            p = Poly(u, x)
+            n = p.degree()
+            if n <= 2:
+                return u
+            coeffs = p.all_coeffs()
+            d = sympy.root(coeffs[0], n)
+            c_coeff = coeffs[1] / (n * d**(n - 1)) if n >= 2 else S.Zero
+            a = expand(u - (c_coeff + d * x)**n)
+            if a.is_number or (not a.has(x) and a != S.Zero):
+                return a + (c_coeff + d * x)**n
+        except Exception:
+            pass
+        return u
+
+
+# =============================================================================
+# SubstFor[v, u, x] or SubstFor[w, v, u, x] — substitution in integrand
+# =============================================================================
+
+class SubstFor(MathematicaExpr):
+    """Rubi SubstFor[v, u, x] or SubstFor[w, v, u, x].
+
+    3-arg SubstFor[v, u, x]: returns u with v replaced by x.
+    4-arg SubstFor[w, v, u, x]: returns simplify(w * SubstFor[v, u, x]).
+
+    Mathematica originals (IntegrationUtilityFunctions.m):
+        SubstFor[v_, u_, x_] := Subst[u, v, x]
+        SubstFor[w_, v_, u_, x_] := SimplifyIntegrand[w * SubstFor[v, u, x], x]
+    """
+
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+
+    def _evaluate(self, **kwargs):
+        # Delegate to the eager implementation. The naive `u.subs(v, x)` used before
+        # is wrong when v has a free factor: SubstFor[b*x, x, x] must be x/b (the
+        # eager one factors it out), not x — the missing 1/b silently multiplied
+        # many symbolic-coefficient results by the linear coefficient.
+        from .utility_functions import eager_SubstFor
+        return eager_SubstFor(*self.args)
+
+
+# Backward-compatible alias (user listed 'SubstrFor'; Rubi calls it 'SubstFor')
+SubstrFor = SubstFor
+
+
+# =============================================================================
+# Additional RUBI utility wrappers for generated code
+# These wrap utility_functions.* implementations for use in generated rules
+# =============================================================================
+
+class Dist(MathematicaExpr):
+    """Rubi Dist[u, v, x] — distribute u over v.
+
+    Rubi also uses a 2-arg ``Dist[u, v]`` (e.g. 3.1.4#3, several inverse-hyperbolic
+    rules) with no integration variable: it just distributes ``u`` over the terms of
+    ``v`` (there is no free-of-x normalisation to do without ``x``).
+    """
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        if len(self.args) == 2:
+            u, v = self.args
+            if getattr(v, 'is_Add', False):
+                return sympy.Add(*[u * t for t in v.args])
+            return u * v
+        from .utility_functions import eager_Dist
+        return eager_Dist(*self.args)
+
+
+class Star(MathematicaExpr):
+    """Rubi Star[u, v] — display-friendly product; u distributed over terms of v.
+
+    Rubi co-opts Wolfram's meaning-free ``\\[Star]`` infix operator as a product
+    that displays as ``u*v`` and evaluates by distributing ``u`` over the terms of
+    ``v`` (see the module docstring on deferred vs eager nodes). Delegates to the
+    eager :func:`utility_functions.eager_Star`.
+
+    In the source rules this arrives as an infix ``u \\[Star] Int[...]``; the
+    code generator reconstructs it into ``Star(u, v)`` (see
+    ``rubi_integrate/codegen/generate.py``), so the coefficient/integral structure is
+    preserved for step reporting and collapses to ``u*v`` on ``doit()``.
+    """
+    def __new__(cls, u, v):
+        return Expr.__new__(cls, sympy.sympify(u), sympy.sympify(v))
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Star
+        return eager_Star(*self.args)
+
+
+class WFApply(MathematicaExpr):
+    """Apply a wildcard-bound function head to arguments — Rubi's ``F[args]``.
+
+    A Rubi pattern ``F_[v_]`` binds ``F`` to a function HEAD (any function); the
+    replacement then re-applies that head, e.g. ``F[a+b*x]``. A function class such
+    as ``sin`` is not a substitutable SymPy object, so the matched head arrives as
+    a :class:`~sympy_matching.wild.HeadRef` wrapper; this node applies it on
+    ``doit``: ``HeadRef(sin)`` + ``(y,)`` -> ``sin(y)``.
+
+    For robustness it also accepts a whole matched application in the first slot
+    (using its ``.func``), so ``WFApply(sin(x), y)`` -> ``sin(y)`` as well.
+    """
+    def __new__(cls, head, *args):
+        safe = [sympy.sympify(head)] + [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+
+    def _evaluate(self, **kwargs):
+        head, *args = self.args
+        func = getattr(head, 'func_class', None)          # HeadRef -> the function
+        if func is None and getattr(head, 'args', None):  # a matched application
+            func = getattr(head, 'func', None)
+        if func is None:
+            return None  # head not resolved yet -> stay unevaluated (see base doit)
+        return func(*args)
+
+
+class WFDeriv(MathematicaExpr):
+    """The n-th derivative of a wildcard-bound function — Rubi's ``Derivative[n][f][x]``.
+
+    The companion of :class:`WFApply` for the derivative rules: a pattern
+    ``Derivative[n_][f_][x_]`` binds ``f`` to a function HEAD (arriving as a
+    :class:`~sympy_matching.wild.HeadRef`) and ``n`` to the order, and the
+    replacement rebuilds e.g. ``Derivative[n-1][f][x]``. On ``doit`` this becomes
+    ``Derivative(f(x), (x, order))`` -- or just ``f(x)`` when the order is 0.
+    """
+    def __new__(cls, head, var, order):
+        return Expr.__new__(cls, sympy.sympify(head), sympy.sympify(var),
+                            sympy.sympify(order))
+
+    def _evaluate(self, **kwargs):
+        head, var, order = self.args
+        func = getattr(head, 'func_class', None)
+        if func is None and getattr(head, 'args', None):
+            func = getattr(head, 'func', None)
+        if func is None:
+            return None  # head not resolved yet -> stay unevaluated (see base doit)
+        applied = func(var)
+        if order == 0:
+            return applied
+        return sympy.Derivative(applied, (var, order))
+
+
+class SimplifyIntegrand(MathematicaExpr):
+    """Rubi SimplifyIntegrand[u, x] — simplify integrand."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SimplifyIntegrand
+        return eager_SimplifyIntegrand(*self.args)
+
+
+class FreeFactors(MathematicaExpr):
+    """Rubi FreeFactors[u, x] — product of factors free of x."""
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FreeFactors
+        return eager_FreeFactors(*self.args)
+
+
+class NonfreeFactors(MathematicaExpr):
+    """Rubi NonfreeFactors[u, x] — product of factors not free of x."""
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_NonfreeFactors
+        return eager_NonfreeFactors(*self.args)
+
+
+class ActivateTrig(MathematicaExpr):
+    """Rubi ActivateTrig[u] — activate trig expressions."""
+    def __new__(cls, u):
+        return Expr.__new__(cls, u)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ActivateTrig
+        return eager_ActivateTrig(self.args[0])
+
+
+class DeactivateTrig(MathematicaExpr):
+    """Rubi DeactivateTrig[u, x] — deactivate trig expressions."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_DeactivateTrig
+        return eager_DeactivateTrig(*self.args)
+
+
+class ExpandTrig(MathematicaExpr):
+    """Rubi ExpandTrig[u, x] — expand trig expressions."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandTrig
+        return eager_ExpandTrig(*self.args)
+
+
+class ExpandTrigReduce(MathematicaExpr):
+    """Rubi ExpandTrigReduce[u, x] — expand and reduce trig."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandTrigReduce
+        return eager_ExpandTrigReduce(*self.args)
+
+
+class DerivativeDivides(MathematicaExpr):
+    """Rubi DerivativeDivides[u, v, x] — check derivative divides."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_DerivativeDivides
+        return eager_DerivativeDivides(*self.args)
+
+
+class BinomialDegree(MathematicaExpr):
+    """Rubi BinomialDegree[u, x] — degree of binomial."""
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_BinomialDegree
+        return eager_BinomialDegree(*self.args)
+
+
+class TrinomialDegree(MathematicaExpr):
+    """Rubi TrinomialDegree[u, x] — degree of trinomial."""
+    def __new__(cls, u, x):
+        return Expr.__new__(cls, u, x)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_TrinomialDegree
+        return eager_TrinomialDegree(*self.args)
+
+
+# Part, First, Rest are standard Wolfram functions — their deferred nodes now live in
+# sympy_wolfram.mathematica_functions and are re-exported at the top of this module.
+
+
+class Numer(MathematicaExpr):
+    """Rubi Numer[u] — numerator (simple form)."""
+    def __new__(cls, u):
+        return Expr.__new__(cls, u)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Numer
+        return eager_Numer(self.args[0])
+
+
+class Denom(MathematicaExpr):
+    """Rubi Denom[u] — denominator (simple form)."""
+    def __new__(cls, u):
+        return Expr.__new__(cls, u)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Denom
+        return eager_Denom(self.args[0])
+
+
+
+
+
+
+# =============================================================================
+# Additional Rubi utility function wrappers
+# =============================================================================
+
+class NormalizePowerOfLinear(MathematicaExpr):
+    """Rubi NormalizePowerOfLinear[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_NormalizePowerOfLinear
+        return eager_NormalizePowerOfLinear(*self.args)
+
+
+class NormalizeIntegrand(MathematicaExpr):
+    """Rubi NormalizeIntegrand[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_NormalizeIntegrand
+        return eager_NormalizeIntegrand(*self.args)
+
+
+# Exponent is a standard Wolfram function — its deferred node now lives in
+# sympy_wolfram.mathematica_functions and is re-exported at the top of this module.
+
+
+class ExpandLinearProduct(MathematicaExpr):
+    """Rubi ExpandLinearProduct[v, u, a, b, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandLinearProduct
+        return eager_ExpandLinearProduct(*self.args)
+
+
+class Divides(MathematicaExpr):
+    """Rubi Divides[u, v, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Divides
+        return eager_Divides(*self.args)
+
+
+class RationalFunctionExpand(MathematicaExpr):
+    """Rubi RationalFunctionExpand[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_RationalFunctionExpand
+        return eager_RationalFunctionExpand(*self.args)
+
+
+class PowerVariableExpn(MathematicaExpr):
+    """Rubi PowerVariableExpn[u, m, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_PowerVariableExpn
+        return eager_PowerVariableExpn(*self.args)
+
+
+class FunctionOfLinear(MathematicaExpr):
+    """Rubi FunctionOfLinear[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfLinear
+        return eager_FunctionOfLinear(*self.args)
+
+
+class SplitProduct(MathematicaExpr):
+    """Rubi SplitProduct[f, u]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SplitProduct
+        return eager_SplitProduct(*self.args)
+
+
+class Rt(MathematicaExpr):
+    """Rubi ``Rt[u, n]`` — the simplest nth root of ``u``.
+
+    Deferred so that rules using ``Rt[u, n_]`` (n_ a wildcard exponent) build an
+    unevaluated node at import time and only compute the actual root at fire time,
+    once ``n_`` is bound to a concrete integer.  ``_evaluate`` delegates to the eager
+    ``utility_functions.eager_Rt`` (= ``RtAux[TogetherSimplify[u], n]``), which reproduces
+    Mathematica's ``Rt``: pull perfect nth powers out of products/powers, handle sign
+    for odd/even n, and fall back to the principal ``NthRoot[u, n] = u^(1/n)``.
+
+    NOTE: this replaces the previous ``Rt -> sympy.root`` codegen shortcut, which only
+    produced a bare principal root and skipped Rubi's simplest-root simplification.
+    """
+    # Rt is a scalar (an nth root), so it is commutative. Without this the base
+    # MathematicaExpr leaves is_commutative indeterminate (None), which makes SymPy's
+    # Mul/hyper construction recurse to the limit when Rt sits deep inside a large
+    # replacement (e.g. rule 1.2.1.2 #101, Rt inside hyper's argument and several
+    # denominators) -- a plain Sqrt worked there only because it is commutative.
+    is_commutative = True
+
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Rt
+        return eager_Rt(*self.args)
+
+
+class PolyGCD(MathematicaExpr):
+    """Rubi PolyGCD[a, b, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_PolyGCD
+        return eager_PolyGCD(*self.args)
+
+
+class GeneralizedTrinomialDegree(MathematicaExpr):
+    """Rubi GeneralizedTrinomialDegree[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_GeneralizedTrinomialDegree
+        return eager_GeneralizedTrinomialDegree(*self.args)
+
+
+class ExpandTrigToExp(MathematicaExpr):
+    """Rubi ExpandTrigToExp[u, x]."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandTrigToExp
+        return eager_ExpandTrigToExp(*self.args)
+
+
+# =============================================================================
+# Lazy MathematicaExpr wrappers for utility_functions plain callables
+# =============================================================================
+# Additional MathematicaExpr wrappers for functions used in generated rules.
+# These were previously missing explicit class definitions.
+# =============================================================================
+
+class MinimumMonomialExponent(MathematicaExpr):
+    """Rubi MinimumMonomialExponent[u, x] — minimum monomial exponent."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_MinimumMonomialExponent
+        return eager_MinimumMonomialExponent(*self.args)
+
+
+class Distrib(MathematicaExpr):
+    """Rubi Distrib[u, v] — distribute u over v."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_Distrib
+        return eager_Distrib(*self.args)
+
+
+# Apart is a standard Wolfram function — its deferred node now lives in
+# sympy_wolfram.mathematica_functions and is re-exported at the top of this module.
+
+
+class ExpandExpression(MathematicaExpr):
+    """Rubi ExpandExpression[u, x] — expand expression."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_ExpandExpression
+        return eager_ExpandExpression(*self.args)
+
+
+class FunctionOfTrig(MathematicaExpr):
+    """Rubi FunctionOfTrig[u, ...] — function of trig."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_FunctionOfTrig
+        return eager_FunctionOfTrig(*self.args)
+
+
+class PolynomialInSubst(MathematicaExpr):
+    """Rubi PolynomialInSubst[u, v, x] — polynomial in substitution."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_PolynomialInSubst
+        return eager_PolynomialInSubst(*self.args)
+
+
+class QuotientOfLinearsParts(MathematicaExpr):
+    """Rubi QuotientOfLinearsParts[u, x] — parts of quotient of linears."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_QuotientOfLinearsParts
+        return eager_QuotientOfLinearsParts(*self.args)
+
+
+class SubstForFractionalPowerOfLinear(MathematicaExpr):
+    """Rubi SubstForFractionalPowerOfLinear[u, x] — substitution for fractional power."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_SubstForFractionalPowerOfLinear
+        return eager_SubstForFractionalPowerOfLinear(*self.args)
+
+
+class TrigSimplify(MathematicaExpr):
+    """Rubi TrigSimplify[u] — simplify trig expression."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_TrigSimplify
+        return eager_TrigSimplify(*self.args)
+
+
+class RationalFunctionExponents(MathematicaExpr):
+    """Rubi RationalFunctionExponents[u, x] — exponents of rational function."""
+    def __new__(cls, *args):
+        safe = [sympy.sympify(a) for a in args]
+        return Expr.__new__(cls, *safe)
+    def _evaluate(self, **kwargs):
+        from .utility_functions import eager_RationalFunctionExponents
+        return eager_RationalFunctionExponents(*self.args)
+
+
+# Denominator is a standard Wolfram function — its deferred node now lives in
+# sympy_wolfram.mathematica_functions and is re-exported at the top of this module.
+
+
+# NOTE: Gamma[z] / Gamma[a, z] is a standard Wolfram function and lives in
+# sympy_wolfram.objects (imported at the top of this module). It used to be
+# redefined here identically -- that duplicate has been removed.
