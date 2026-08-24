@@ -9,7 +9,6 @@ Tests the FFL-to-Python translation pipeline:
 - End-to-end: parse .m file -> generate -> load -> integrate
 """
 import re
-import sys
 import os
 import pytest
 import py_compile
@@ -31,7 +30,6 @@ pytestmark = pytest.mark.skipif(
     reason='sympy.parsing.mathematica.parse_mathematica_to_fullformlist not '
            'available in this sympy version (needs sympy > 1.14)')
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from rubi_integrate.codegen.generate import RubiRuleTranslator
 

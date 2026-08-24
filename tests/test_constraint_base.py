@@ -10,10 +10,7 @@ integrate with the MathematicaConstraint base class from sympy_wolfram:
 - Hash consistency
 - JSON round-trip via sympy_matching.json_ext
 """
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import pytest
 import sympy
