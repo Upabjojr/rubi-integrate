@@ -4,13 +4,10 @@
 Tests the full pipeline:
     SymPy rule definitions -> OmniMatch patterns -> pattern matching -> replacement -> SymPy result
 """
-import sys
-import os
 import pytest
 import sympy
 from sympy import Symbol, Integer, Rational, log, sqrt, pi, oo
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from sympy_matching.wild import WildSymbol, IDENTITY_ELEMENT
 from sympy_matching.conversion import to_omnimatch_expression, omnimatch_to_sympy

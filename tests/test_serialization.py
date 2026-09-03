@@ -6,12 +6,10 @@ Tests that:
 - Constraint objects can be serialized and deserialized
 - A full replacer can be serialized, deserialized, and still integrates correctly
 """
-import sys
 import os
 import json
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import sympy
 from sympy import Symbol, Integer, Rational, log, sqrt, sin, cos, pi
